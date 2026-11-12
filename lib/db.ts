@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { DatabaseSync } from 'node:sqlite';
+import type { DatabaseSync } from 'node:sqlite';
 import { Pool, PoolClient } from 'pg';
 import bcrypt from 'bcryptjs';
 import {
@@ -772,9 +772,10 @@ export async function getDb(): Promise<DbDriver> {
     dbState.initPromise = (async () => {
       const pgConfig = getPostgresConfig();
       if (pgConfig.configured) {
+        const isBuildPhase = process.env.NEXT_PHASE === 'phase-production-build';
         const poolLimits = {
-          max: process.env.VERCEL ? 5 : 10,
-          idleTimeoutMillis: 10000,
+          max: isBuildPhase ? 1 : process.env.VERCEL ? 5 : 10,
+          idleTimeoutMillis: isBuildPhase ? 1000 : 10000,
           connectionTimeoutMillis: 10000
         };
         const pool = new Pool(
@@ -829,7 +830,10 @@ export async function getDb(): Promise<DbDriver> {
       if (!fs.existsSync(DATA_DIR)) {
         fs.mkdirSync(DATA_DIR, { recursive: true });
       }
-      const sqlite = new DatabaseSync(DB_PATH);
+      // Lazy-load node:sqlite so Node 20 environments on Vercel never crash on module import when using PostgreSQL
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { DatabaseSync: SqliteDatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+      const sqlite = new SqliteDatabaseSync(DB_PATH);
       sqlite.exec('PRAGMA busy_timeout = 10000;');
       sqlite.exec('PRAGMA journal_mode = WAL;');
       sqlite.exec('PRAGMA foreign_keys = ON;');

@@ -5,6 +5,8 @@ import AnnouncementBar from '@/components/layout/AnnouncementBar';
 import CartDrawer from '@/components/cart/CartDrawer';
 import { getCategories, getStoreSettings } from '@/lib/db';
 
+export const dynamic = 'force-dynamic';
+
 export default async function StorefrontLayout({
   children,
 }: {

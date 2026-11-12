@@ -3,6 +3,7 @@ import './globals.css';
 import { ToastProvider } from '@/components/ui/ToastContext';
 import { CartProvider } from '@/components/cart/CartContext';
 import { getStoreSettings } from '@/lib/db';
+import { initialStoreSettings } from '@/lib/seed-data';
 
 export const viewport: Viewport = {
   themeColor: '#13293d',
@@ -12,7 +13,14 @@ export const viewport: Viewport = {
 };
 
 export async function generateMetadata(): Promise<Metadata> {
-  const settings = await getStoreSettings();
+  let settings = initialStoreSettings;
+  if (process.env.NEXT_PHASE !== 'phase-production-build') {
+    try {
+      settings = await getStoreSettings();
+    } catch (err) {
+      console.warn('[Metadata] Falling back to default store settings:', (err as Error)?.message || err);
+    }
+  }
   return {
     metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000'),
     title: {
