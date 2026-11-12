@@ -5,14 +5,69 @@ import { getUserFromRequest } from '@/lib/auth';
 
 export const dynamic = 'force-dynamic';
 
-const UPLOADS_DIR = path.join(process.cwd(), 'public', 'uploads');
-
-if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-}
-
 const ALLOWED_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml'];
 const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+
+function resolveSupabaseStorageConfig() {
+  const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  const explicitUrl = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '').trim();
+  const pgHost = (process.env.PGHOST || '').trim();
+  const derivedUrl =
+    !explicitUrl && pgHost.startsWith('db.') && pgHost.endsWith('.supabase.co')
+      ? `https://${pgHost.slice(3)}`
+      : '';
+  const supabaseUrl = (explicitUrl || derivedUrl).replace(/\/+$/, '');
+  const bucket = (process.env.SUPABASE_STORAGE_BUCKET || 'virasat-media').trim();
+  return {
+    configured: Boolean(supabaseUrl && serviceRoleKey),
+    supabaseUrl,
+    serviceRoleKey,
+    bucket
+  };
+}
+
+async function uploadToSupabaseStorage(
+  supabaseUrl: string,
+  serviceRoleKey: string,
+  bucket: string,
+  filename: string,
+  buffer: Buffer,
+  contentType: string
+): Promise<string> {
+  const objectUrl = `${supabaseUrl}/storage/v1/object/${encodeURIComponent(bucket)}/${encodeURIComponent(filename)}`;
+  const headers = {
+    apikey: serviceRoleKey,
+    Authorization: `Bearer ${serviceRoleKey}`,
+    'Content-Type': contentType,
+    'x-upsert': 'true'
+  };
+
+  let res = await fetch(objectUrl, { method: 'POST', headers, body: new Uint8Array(buffer) });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    if (res.status === 404 || errText.toLowerCase().includes('bucket not found')) {
+      await fetch(`${supabaseUrl}/storage/v1/bucket`, {
+        method: 'POST',
+        headers: {
+          apikey: serviceRoleKey,
+          Authorization: `Bearer ${serviceRoleKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ id: bucket, name: bucket, public: true })
+      });
+      res = await fetch(objectUrl, { method: 'POST', headers, body: new Uint8Array(buffer) });
+    } else {
+      throw new Error(`Supabase Storage error (${res.status}): ${errText || res.statusText}`);
+    }
+  }
+
+  if (!res.ok) {
+    const retryErr = await res.text().catch(() => '');
+    throw new Error(`Supabase Storage upload failed (${res.status}): ${retryErr || res.statusText}`);
+  }
+
+  return `${supabaseUrl}/storage/v1/object/public/${encodeURIComponent(bucket)}/${encodeURIComponent(filename)}`;
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -44,11 +99,44 @@ export async function POST(req: NextRequest) {
 
     const buffer = Buffer.from(await file.arrayBuffer());
     const ext = path.extname(file.name) || '.jpg';
-    const cleanBase = path.basename(file.name, ext).replace(/[^a-zA-Z0-9_-]/g, '');
+    const cleanBase = path.basename(file.name, ext).replace(/[^a-zA-Z0-9_-]/g, '') || 'image';
     const filename = `${cleanBase}-${Date.now()}${ext}`;
-    const filePath = path.join(UPLOADS_DIR, filename);
 
-    fs.writeFileSync(filePath, buffer);
+    const storage = resolveSupabaseStorageConfig();
+    if (storage.configured) {
+      const publicUrl = await uploadToSupabaseStorage(
+        storage.supabaseUrl,
+        storage.serviceRoleKey,
+        storage.bucket,
+        filename,
+        buffer,
+        file.type
+      );
+      return NextResponse.json({
+        success: true,
+        url: publicUrl,
+        filename,
+        size: file.size,
+        mimeType: file.type,
+        storage: 'supabase'
+      });
+    }
+
+    if (process.env.VERCEL) {
+      return NextResponse.json(
+        {
+          error:
+            'Local disk uploads are not persistent on Vercel. Please paste an image URL directly, or set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Vercel Environment Variables.'
+        },
+        { status: 503 }
+      );
+    }
+
+    const uploadsDir = path.join(process.cwd(), 'public', 'uploads');
+    if (!fs.existsSync(uploadsDir)) {
+      fs.mkdirSync(uploadsDir, { recursive: true });
+    }
+    fs.writeFileSync(path.join(uploadsDir, filename), buffer);
 
     const publicUrl = `/uploads/${filename}`;
 
@@ -57,7 +145,8 @@ export async function POST(req: NextRequest) {
       url: publicUrl,
       filename,
       size: file.size,
-      mimeType: file.type
+      mimeType: file.type,
+      storage: 'local'
     });
   } catch (err: any) {
     return NextResponse.json({ error: err.message || 'File upload failed' }, { status: 500 });

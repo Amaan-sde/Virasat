@@ -75,6 +75,20 @@ function getPostgresConfig() {
   const password = (process.env.PGPASSWORD || process.env.DB_PASSWORD || process.env.password || '').trim();
 
   if (databaseUrl && !isPlaceholder(databaseUrl)) {
+    let parsedHost = host || 'postgres-url';
+    let parsedPort = port;
+    let parsedDatabase = database;
+    let parsedUser = user;
+    try {
+      const u = new URL(databaseUrl);
+      if (u.hostname) parsedHost = u.hostname;
+      if (u.port) parsedPort = Number(u.port);
+      if (u.pathname && u.pathname.length > 1) parsedDatabase = u.pathname.slice(1);
+      if (u.username) parsedUser = decodeURIComponent(u.username);
+    } catch {
+      // keep fallbacks if URL parsing fails
+    }
+
     const useSsl =
       databaseUrl.includes('supabase.') ||
       databaseUrl.includes('sslmode=require') ||
@@ -82,10 +96,10 @@ function getPostgresConfig() {
     return {
       configured: true,
       connectionString: databaseUrl,
-      host: host || 'postgres-url',
-      port,
-      database,
-      user,
+      host: parsedHost,
+      port: parsedPort,
+      database: parsedDatabase,
+      user: parsedUser,
       useSsl
     };
   }
@@ -349,44 +363,38 @@ const SCHEMA_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_orders_status ON orders (order_status)`
 ];
 
-async function initSchemaAndSeed(driver: DbDriver) {
+async function hasAllTables(driver: DbDriver): Promise<boolean> {
   if (driver.kind === 'sqlite') {
     const existingTables = await driver.all<{ name: string }>(
       "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('users','categories','collections','products','orders','discounts','homepage_sections','store_settings','reviews','audit_logs')"
     );
-    if (existingTables.length < 10) {
-      for (const stmt of SCHEMA_STATEMENTS) {
-        await driver.exec(stmt);
-      }
+    return existingTables.length >= 10;
+  }
+  const existingTables = await driver.all<{ table_name: string }>(
+    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('users','categories','collections','products','orders','discounts','homepage_sections','store_settings','reviews','audit_logs')"
+  );
+  return existingTables.length >= 10;
+}
+
+async function isDatabaseSeeded(driver: DbDriver): Promise<boolean> {
+  for (const table of ['products', 'categories', 'homepage_sections', 'store_settings', 'users']) {
+    const row = await driver.get<{ count: number | string }>(`SELECT COUNT(*) as count FROM ${table}`);
+    if (Number(row?.count || 0) === 0) {
+      return false;
     }
-  } else {
-    const existingTables = await driver.all<{ table_name: string }>(
-      "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('users','categories','collections','products','orders','discounts','homepage_sections','store_settings','reviews','audit_logs')"
-    );
-    if (existingTables.length < 10) {
-      for (const stmt of SCHEMA_STATEMENTS) {
-        await driver.exec(stmt);
-      }
+  }
+  return true;
+}
+
+async function initSchemaAndSeed(driver: DbDriver) {
+  if (!(await hasAllTables(driver))) {
+    for (const stmt of SCHEMA_STATEMENTS) {
+      await driver.exec(stmt);
     }
   }
 
   // Always check whether core catalogue/settings tables are empty so incomplete/empty DBs get seeded
-  const [prodCount, catCount, secCount, setCount, userCount] = await Promise.all([
-    driver.get<{ count: number | string }>('SELECT COUNT(*) as count FROM products'),
-    driver.get<{ count: number | string }>('SELECT COUNT(*) as count FROM categories'),
-    driver.get<{ count: number | string }>('SELECT COUNT(*) as count FROM homepage_sections'),
-    driver.get<{ count: number | string }>('SELECT COUNT(*) as count FROM store_settings'),
-    driver.get<{ count: number | string }>('SELECT COUNT(*) as count FROM users')
-  ]);
-
-  const needsSeed =
-    Number(prodCount?.count || 0) === 0 ||
-    Number(catCount?.count || 0) === 0 ||
-    Number(secCount?.count || 0) === 0 ||
-    Number(setCount?.count || 0) === 0 ||
-    Number(userCount?.count || 0) === 0;
-
-  if (needsSeed) {
+  if (!(await isDatabaseSeeded(driver))) {
     await seedInitialData(driver);
   }
 }
@@ -764,12 +772,17 @@ export async function getDb(): Promise<DbDriver> {
     dbState.initPromise = (async () => {
       const pgConfig = getPostgresConfig();
       if (pgConfig.configured) {
+        const poolLimits = {
+          max: process.env.VERCEL ? 5 : 10,
+          idleTimeoutMillis: 10000,
+          connectionTimeoutMillis: 10000
+        };
         const pool = new Pool(
           'connectionString' in pgConfig && pgConfig.connectionString
             ? {
                 connectionString: pgConfig.connectionString,
                 ssl: pgConfig.useSsl ? { rejectUnauthorized: false } : undefined,
-                connectionTimeoutMillis: 10000
+                ...poolLimits
               }
             : {
                 host: pgConfig.host,
@@ -778,23 +791,27 @@ export async function getDb(): Promise<DbDriver> {
                 user: pgConfig.user,
                 password: pgConfig.password,
                 ssl: pgConfig.useSsl ? { rejectUnauthorized: false } : undefined,
-                connectionTimeoutMillis: 10000
+                ...poolLimits
               }
         );
 
         try {
-          const client = await pool.connect();
-          try {
-            await client.query('SELECT pg_advisory_lock(84920142)');
-            try {
-              await initSchemaAndSeed(createPgDriver(client));
-            } finally {
-              await client.query('SELECT pg_advisory_unlock(84920142)').catch(() => {});
-            }
-          } finally {
-            client.release();
-          }
           const driver = createPgDriver(pool);
+          // Skip advisory locks on already-initialized DBs (compatible with PgBouncer transaction pooler)
+          const ready = (await hasAllTables(driver)) && (await isDatabaseSeeded(driver));
+          if (!ready) {
+            const client = await pool.connect();
+            try {
+              await client.query('SELECT pg_advisory_lock(84920142)');
+              try {
+                await initSchemaAndSeed(createPgDriver(client));
+              } finally {
+                await client.query('SELECT pg_advisory_unlock(84920142)').catch(() => {});
+              }
+            } finally {
+              client.release();
+            }
+          }
           dbState.pgPool = pool;
           dbState.driver = driver;
           console.info(`[DB] Connected to PostgreSQL (${pgConfig.host}:${pgConfig.port}/${pgConfig.database})`);

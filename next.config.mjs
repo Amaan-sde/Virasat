@@ -22,6 +22,10 @@ const nextConfig = {
       {
         protocol: 'https',
         hostname: 'assets.folkbazar.com',
+      },
+      {
+        protocol: 'https',
+        hostname: '**.supabase.co',
       }
     ],
   },
